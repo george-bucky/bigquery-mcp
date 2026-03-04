@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use gcp_auth::TokenProvider;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
@@ -25,7 +26,7 @@ const MAX_RETRIES: u32 = 3;
 #[derive(Clone)]
 pub struct BigQueryClient {
     http: reqwest::Client,
-    auth: Arc<dyn TokenProvider>,
+    auth_provider: Arc<OnceCell<Arc<dyn TokenProvider>>>,
     config: Config,
     concurrency_limiter: Arc<Semaphore>,
 }
@@ -144,21 +145,31 @@ impl BigQueryClient {
             .build()
             .map_err(|err| AppError::Transport(format!("failed to build http client: {err}")))?;
 
-        let auth = gcp_auth::provider().await.map_err(|err| {
-            AppError::Unauthenticated(format!("failed to initialize ADC authentication: {err}"))
-        })?;
-
         Ok(Self {
             http,
-            auth,
+            auth_provider: Arc::new(OnceCell::new()),
             concurrency_limiter: Arc::new(Semaphore::new(config.max_concurrency)),
             config,
         })
     }
 
+    async fn auth_provider(&self) -> Result<Arc<dyn TokenProvider>> {
+        let provider = self
+            .auth_provider
+            .get_or_try_init(|| async {
+                gcp_auth::provider().await.map_err(|err| {
+                    AppError::Unauthenticated(format!(
+                        "failed to initialize ADC authentication: {err}"
+                    ))
+                })
+            })
+            .await?;
+        Ok(provider.clone())
+    }
+
     async fn bearer_token(&self) -> Result<String> {
-        let token = self
-            .auth
+        let provider = self.auth_provider().await?;
+        let token = provider
             .token(&[SCOPE_CLOUD_PLATFORM])
             .await
             .map_err(|err| {
