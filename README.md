@@ -1,34 +1,75 @@
-# bigquery-mcp
+# bigquery-mcp (Rust)
 
-A Model Context Protocol (MCP) Server for BigQuery.
+A Rust Model Context Protocol (MCP) server for BigQuery.
+
+This is a breaking v2 rebuild focused on lower latency, lower BigQuery/API fanout, and structured JSON tool responses.
+
+## What Changed
+
+- Rebuilt in Rust (`tokio` + `reqwest`) with MCP over stdio.
+- Tool outputs are structured JSON via `structuredContent`.
+- Added in-process TTL caching with per-key request coalescing.
+- Removed expensive `ORDER BY RAND()` query-history pattern.
+- Replaced N+1 table metadata fetch with a single INFORMATION_SCHEMA query.
+- Region is fully dynamic (no hardcoded region in query SQL).
+
+## Tools
+
+- `get_datasets`
+- `get_all_dataset_descriptions`
+- `get_dataset_description`
+- `get_tables`
+- `get_columns`
+- `get_query_history`
 
 ## Prerequisites
 
-This project and the `mcp` CLI rely on your having the dependency management tool `uv` installed. You can install via e.g. `brew install uv` for Homebrew users. [See here for alternatives](https://docs.astral.sh/uv/getting-started/installation).
+- Rust toolchain (`cargo`, `rustc`)
+- BigQuery access via Application Default Credentials (ADC)
 
-This project (currently) assumes you can 'transparently' create a BigQuery `Client`, which is usually the case if you have `gcloud` installed in your local environment. In other environments you may need suitable service account credentials (and you can set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to indicate the location of these credentials to the BigQuery client library).
+## Configuration
 
-### For development
+Required:
 
-You will also need to have `Taskfile` installed. `brew install go-task` will work if you are a `Homebrew` user.
-[See here for alternatives](https://taskfile.dev/installation).
+- `BIGQUERY_PROJECT_ID`
 
-## Quickstart for Cursor IDE
+Optional:
 
-0. ensure you have the prerequisites installed
-1. clone down this repository
-2. run `uv sync` to install the dependencies
-3. in Cursor settings > MCP Servers, start a server with the following command:
+- `BIGQUERY_REGION` (default: `europe-west2`)
+- `BQ_CACHE_TTL_DATASETS_SECS` (default: `60`)
+- `BQ_CACHE_TTL_DATASET_DETAILS_SECS` (default: `300`)
+- `BQ_CACHE_TTL_TABLES_SECS` (default: `180`)
+- `BQ_CACHE_TTL_COLUMNS_SECS` (default: `300`)
+- `BQ_CACHE_TTL_QUERY_HISTORY_SECS` (default: `30`)
+- `BQ_MAX_CONCURRENCY` (default: `16`)
+- `BQ_QUERY_TIMEOUT_SECS` (default: `15`)
+- `BQ_HUMAN_EMAIL_DOMAIN` (optional, only include human users from this domain)
+- `BIGQUERY_API_BASE_URL` (default: `https://bigquery.googleapis.com/bigquery/v2`, useful for tests/mocks)
 
-`uv run --with mcp --directory /path/to/bigquery-mcp mcp run /path/to/bigquery-mcp/src/server.py`
+## Run
 
-It is recommended to write a contextual rule in `.cursor/rules/tool-use-rule.mdc` into your working project. The Cursor Agent will need some instructions if it is 
-to use the tools properly.
+```bash
+cargo run --release
+```
 
-## Details
+The server uses stdio transport and is MCP-compatible.
 
-AI Agents have begun to excel at writing code, but often struggle with data-related tasks. This is because of the coupling between programme logic and the actual contents of the database.
+## Quick MCP Setup (Cursor)
 
-More specifically, AI Agents often fail to write good SQL queries for analysis tasks. They are capable of writing code, so the issue is not a lack of ability in this arena and more due to a lack of context about the _contents_ of the database.
+Point your MCP server command at the built binary, e.g.:
 
-This MCP server assists with this problem area by providing AI Agents with tools they can use to examine the contents of a BigQuery data warehouse (i.e. datasets, tables, columns, query history).
+```bash
+/path/to/bigquery-mcp/target/release/bigquery-mcp-rs
+```
+
+## Development
+
+```bash
+cargo fmt
+cargo test
+```
+
+## Notes
+
+- This implementation intentionally does not preserve Python output formatting compatibility.
+- The legacy Python implementation is still present in the repo but is no longer the primary runtime.

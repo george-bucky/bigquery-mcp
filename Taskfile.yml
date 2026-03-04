@@ -1,6 +1,21 @@
 version: '3'
 
 tasks:
+    rust-format:
+        cmds:
+            - /opt/homebrew/bin/cargo fmt
+        desc: Format Rust files
+
+    rust-test:
+        cmds:
+            - /opt/homebrew/bin/cargo test
+        desc: Run Rust unit tests
+
+    rust-check:
+        cmds:
+            - /opt/homebrew/bin/cargo fmt --check
+            - /opt/homebrew/bin/cargo test
+        desc: Run Rust formatting checks and tests
 
     format:
         cmds:
