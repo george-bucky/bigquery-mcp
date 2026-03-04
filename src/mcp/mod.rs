@@ -35,6 +35,12 @@ pub struct McpServer {
     service: Arc<Service>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportMode {
+    ContentLength,
+    Ndjson,
+}
+
 impl McpServer {
     pub fn new(service: Arc<Service>) -> Self {
         Self { service }
@@ -48,7 +54,7 @@ impl McpServer {
         let writer = Arc::new(Mutex::new(stdout));
 
         loop {
-            let Some(message) = read_message(&mut reader).await? else {
+            let Some((message, message_transport_mode)) = read_message(&mut reader).await? else {
                 break;
             };
 
@@ -63,14 +69,14 @@ impl McpServer {
                         },
                         "id": Value::Null
                     });
-                    write_message(&writer, &error).await?;
+                    write_message(&writer, &error, message_transport_mode).await?;
                     continue;
                 }
             };
 
             match self.handle_request(request).await {
                 Ok(Some(response)) => {
-                    write_message(&writer, &response).await?;
+                    write_message(&writer, &response, message_transport_mode).await?;
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -207,7 +213,9 @@ fn map_serde_err(err: serde_json::Error) -> AppError {
     AppError::Serialization(err.to_string())
 }
 
-async fn read_message(reader: &mut BufReader<io::Stdin>) -> io::Result<Option<Vec<u8>>> {
+async fn read_message(
+    reader: &mut BufReader<io::Stdin>,
+) -> io::Result<Option<(Vec<u8>, TransportMode)>> {
     let mut content_length: Option<usize> = None;
 
     loop {
@@ -218,18 +226,20 @@ async fn read_message(reader: &mut BufReader<io::Stdin>) -> io::Result<Option<Ve
         }
 
         let line = line.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
 
-        if line.is_empty() {
+        if trimmed.is_empty() {
+            if content_length.is_none() {
+                continue;
+            }
             break;
         }
 
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            let parsed = value.trim().parse::<usize>().map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid Content-Length: {err}"),
-                )
-            })?;
+        if content_length.is_none() && is_ndjson_jsonrpc_payload(trimmed) {
+            return Ok(Some((trimmed.as_bytes().to_vec(), TransportMode::Ndjson)));
+        }
+
+        if let Some(parsed) = parse_content_length_header(trimmed)? {
             content_length = Some(parsed);
         }
     }
@@ -243,17 +253,51 @@ async fn read_message(reader: &mut BufReader<io::Stdin>) -> io::Result<Option<Ve
 
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body).await?;
-    Ok(Some(body))
+    Ok(Some((body, TransportMode::ContentLength)))
 }
 
-async fn write_message(writer: &Arc<Mutex<Stdout>>, value: &Value) -> io::Result<()> {
+fn is_ndjson_jsonrpc_payload(trimmed_line: &str) -> bool {
+    trimmed_line.starts_with('{') || trimmed_line.starts_with('[')
+}
+
+fn parse_content_length_header(line: &str) -> io::Result<Option<usize>> {
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(None);
+    };
+
+    if !name.trim().eq_ignore_ascii_case("content-length") {
+        return Ok(None);
+    }
+
+    let parsed = value.trim().parse::<usize>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Content-Length: {err}"),
+        )
+    })?;
+    Ok(Some(parsed))
+}
+
+async fn write_message(
+    writer: &Arc<Mutex<Stdout>>,
+    value: &Value,
+    transport_mode: TransportMode,
+) -> io::Result<()> {
     let payload = serde_json::to_vec(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
 
     let mut writer = writer.lock().await;
-    writer.write_all(header.as_bytes()).await?;
-    writer.write_all(&payload).await?;
+    match transport_mode {
+        TransportMode::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+            writer.write_all(header.as_bytes()).await?;
+            writer.write_all(&payload).await?;
+        }
+        TransportMode::Ndjson => {
+            writer.write_all(&payload).await?;
+            writer.write_all(b"\n").await?;
+        }
+    }
     writer.flush().await?;
     Ok(())
 }
@@ -346,4 +390,64 @@ pub fn init_logging() {
         .init();
 
     info!("logging initialized");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_ndjson_jsonrpc_payload, parse_content_length_header};
+
+    #[test]
+    fn parse_content_length_accepts_whitespace() {
+        let parsed = parse_content_length_header("  Content-Length : 123  ")
+            .expect("header should parse")
+            .expect("should return a content length");
+        assert_eq!(parsed, 123);
+    }
+
+    #[test]
+    fn parse_content_length_accepts_lowercase() {
+        let parsed = parse_content_length_header("content-length: 123")
+            .expect("header should parse")
+            .expect("should return a content length");
+        assert_eq!(parsed, 123);
+    }
+
+    #[test]
+    fn parse_content_length_accepts_mixed_case() {
+        let parsed = parse_content_length_header("CoNtEnT-LeNgTh: 77")
+            .expect("header should parse")
+            .expect("should return a content length");
+        assert_eq!(parsed, 77);
+    }
+
+    #[test]
+    fn parse_content_length_ignores_other_headers() {
+        let parsed = parse_content_length_header("Accept: */*").expect("should not fail");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_content_length_rejects_invalid_numbers() {
+        let err =
+            parse_content_length_header("Content-Length: nope").expect_err("should fail to parse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn ndjson_payload_accepts_json_object() {
+        assert!(is_ndjson_jsonrpc_payload(r#"{"jsonrpc":"2.0","id":1}"#));
+    }
+
+    #[test]
+    fn ndjson_payload_accepts_json_array_batch() {
+        assert!(is_ndjson_jsonrpc_payload(
+            r#"[{"jsonrpc":"2.0","id":1},{"jsonrpc":"2.0","id":2}]"#
+        ));
+    }
+
+    #[test]
+    fn ndjson_payload_rejects_non_json_lines() {
+        assert!(!is_ndjson_jsonrpc_payload("Content-Length: 123"));
+        assert!(!is_ndjson_jsonrpc_payload(""));
+    }
 }
